@@ -1,0 +1,335 @@
+name: CodeRefactor AI — Automated Refactoring Pipeline
+
+on:
+  # Trigger manually via GitHub UI
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Repository URL to analyze and refactor'
+        required: true
+        type: string
+      function_only:
+        description: 'Only refactor functions matching this name (optional)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run (analyze only, no refactoring)'
+        required: false
+        default: false
+        type: boolean
+
+  # Trigger on push to main branch
+  push:
+    branches: [main]
+
+  # Trigger on pull request
+  pull_request:
+    branches: [main]
+
+  # Scheduled run (weekly: every Monday at 09:00 UTC)
+  schedule:
+    - cron: '0 9 * * 1'
+
+env:
+  PYTHON_VERSION: '3.11'
+  # Set your OpenRouter API key as a GitHub Secret: OPENROUTER_API_KEY
+  OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+jobs:
+  analyze:
+    name: Analyze Code Smells
+    runs-on: ubuntu-latest
+    outputs:
+      has_bad_smells: ${{ steps.smell_check.outputs.has_bad_smells }}
+      report_path: ${{ steps.smell_check.outputs.report_path }}
+
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install scikit-learn imbalanced-learn
+
+      - name: Train smell detection model
+        run: |
+          python src/train_smell_model.py
+
+      - name: Detect changed Python files
+        id: changed_files
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.repo_url }}" ]; then
+            # Remote repo mode: scan everything
+            echo "changed_files=none" >> $GITHUB_OUTPUT
+          else
+            # Push/PR mode: find changed Python files
+            CHANGED=""
+            if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+              # PR mode: diff against base branch
+              BASE="${{ github.event.pull_request.base.sha }}"
+              CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD | grep '\.py$' || true)
+            fi
+            if [ -z "$CHANGED" ]; then
+              # Fallback: diff against parent commit (push mode)
+              CHANGED=$(git diff --name-only --diff-filter=ACMR HEAD~1 HEAD 2>/dev/null | grep '\.py$' || true)
+            fi
+            if [ -z "$CHANGED" ]; then
+              echo "No changed Python files detected via git diff. Falling back to full repo scan."
+              echo "changed_files=none" >> $GITHUB_OUTPUT
+            else
+              echo "Changed Python files:"
+              echo "$CHANGED"
+              echo "changed_files=python" >> $GITHUB_OUTPUT
+              # Write to file for later steps
+              echo "$CHANGED" > /tmp/changed_py_files.txt
+            fi
+          fi
+
+      - name: Run code smell analysis
+        id: smell_check
+        # Always run this step so has_bad_smells output is always set
+        run: |
+          set +e
+          REPORT_FILE="${{ github.workspace }}/refactor-report.json"
+          SRC_DIR="${{ github.workspace }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.repo_url }}" ]; then
+            CMD="python cli.py --repo \"${{ github.event.inputs.repo_url }}\" --output \"$SRC_DIR\" --dry-run --json --verbose"
+            echo "Running (remote repo): $CMD"
+            eval $CMD
+            CLI_EXIT=$?
+          elif [ -f /tmp/changed_py_files.txt ] && [ -s /tmp/changed_py_files.txt ]; then
+            FILES=$(paste -sd ' ' /tmp/changed_py_files.txt)
+            ABS_FILES=""
+            for f in $(cat /tmp/changed_py_files.txt); do
+              if [ -f "$SRC_DIR/$f" ]; then
+                ABS_FILES="$ABS_FILES \"$SRC_DIR/$f\""
+              elif [ -f "$f" ]; then
+                ABS_FILES="$ABS_FILES \"$f\""
+              fi
+            done
+            if [ -n "$ABS_FILES" ]; then
+              CMD="python cli.py --files $ABS_FILES --output \"$SRC_DIR\" --dry-run --json --verbose"
+              echo "Running (changed files): $CMD"
+              echo "=== Changed Python Files ==="
+              cat /tmp/changed_py_files.txt
+              echo "============================"
+              eval $CMD
+              CLI_EXIT=$?
+            else
+              echo "Changed files list is empty. Falling back to full repo scan."
+              CMD="python cli.py --repo \"$SRC_DIR\" --output \"$SRC_DIR\" --dry-run --json --verbose"
+              echo "Running (full repo): $CMD"
+              eval $CMD
+              CLI_EXIT=$?
+            fi
+          else
+            echo "No specific changed files detected. Scanning entire repository."
+            CMD="python cli.py --repo \"$SRC_DIR\" --output \"$SRC_DIR\" --dry-run --json --verbose"
+            echo "Running (full repo): $CMD"
+            eval $CMD
+            CLI_EXIT=$?
+          fi
+          set -e
+
+          echo "CLI exit code: $CLI_EXIT"
+
+          # Check if there are bad smells in the report (always run this)
+          if [ -f "$REPORT_FILE" ]; then
+            BAD_COUNT=$(python -c "import json; d=json.load(open('$REPORT_FILE')); print(sum(1 for r in d if r.get('is_bad_smell')))")
+            echo "has_bad_smells=$([ "$BAD_COUNT" -gt "0" ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+            echo "report_path=$REPORT_FILE" >> $GITHUB_OUTPUT
+            echo "Bad smells found: $BAD_COUNT"
+            echo ""
+            echo "=== Detailed Smell Breakdown ==="
+            python src/print_smell_report.py "$REPORT_FILE"
+            echo "==============================="
+          else
+            echo "has_bad_smells=false" >> $GITHUB_OUTPUT
+            echo "Report file not found: $REPORT_FILE"
+          fi
+
+          # Log CLI exit for debugging but don't fail
+          if [ "$CLI_EXIT" -ne 0 ]; then
+            echo "⚠ CLI exited with code $CLI_EXIT (analysis may be incomplete)"
+          fi
+
+      - name: Upload analysis report
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-smell-report
+          path: refactor-report.json
+          retention-days: 30
+
+  refactor:
+    name: Refactor Bad-Smell Functions
+    needs: analyze
+    if: needs.analyze.outputs.has_bad_smells == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install scikit-learn imbalanced-learn
+
+      - name: Train smell detection model
+        run: |
+          python src/train_smell_model.py
+
+      - name: Detect changed Python files (refactor)
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.repo_url }}" ]; then
+            echo "refactoring_mode=remote" >> $GITHUB_ENV
+          else
+            CHANGED=""
+            if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+              BASE="${{ github.event.pull_request.base.sha }}"
+              CHANGED=$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD | grep '\.py$' || true)
+            fi
+            if [ -z "$CHANGED" ]; then
+              CHANGED=$(git diff --name-only --diff-filter=ACMR HEAD~1 HEAD 2>/dev/null | grep '\.py$' || true)
+            fi
+            if [ -n "$CHANGED" ]; then
+              # Write absolute paths
+              > /tmp/changed_py_files.txt
+              for f in $CHANGED; do
+                echo "${{ github.workspace }}/$f" >> /tmp/changed_py_files.txt
+              done
+              echo "refactoring_mode=files" >> $GITHUB_ENV
+            else
+              echo "refactoring_mode=full" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Run full refactoring pipeline (in-place)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set +e
+          echo "=== Refactoring Mode: ${{ env.refactoring_mode }} ==="
+
+          if [ "${{ env.refactoring_mode }}" = "remote" ]; then
+            CMD="python cli.py --repo \"${{ github.event.inputs.repo_url }}\" --output \"${{ github.workspace }}\" --in-place --json --verbose"
+          elif [ "${{ env.refactoring_mode }}" = "files" ] && [ -f /tmp/changed_py_files.txt ]; then
+            FILES=$(paste -sd ' ' /tmp/changed_py_files.txt)
+            echo "=== Changed Files to Refactor ==="
+            cat /tmp/changed_py_files.txt
+            echo "================================"
+            CMD="python cli.py --files $FILES --output \"${{ github.workspace }}\" --in-place --json --verbose"
+          else
+            CMD="python cli.py --repo \"${{ github.workspace }}\" --output \"${{ github.workspace }}\" --in-place --json --verbose"
+          fi
+
+          if [ -n "${{ github.event.inputs.function_only }}" ]; then
+            CMD="$CMD --function-only \"${{ github.event.inputs.function_only }}\""
+          fi
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            CMD="$CMD --dry-run"
+          fi
+
+          echo "Running: $CMD"
+          eval $CMD
+          CLI_EXIT=$?
+          set -e
+
+          # Print detailed per-function summary from report
+          REPORT="${{ github.workspace }}/refactor-report.json"
+          if [ -f "$REPORT" ]; then
+            echo ""
+            echo "=== Refactoring Results ==="
+            python src/print_refactor_results.py "$REPORT"
+            echo "========================="
+          fi
+
+          if [ "$CLI_EXIT" -ne 0 ]; then
+            echo "⚠ Refactoring CLI exited with code $CLI_EXIT"
+          fi
+
+      - name: Upload refactored code (artifact backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: refactored-code
+          path: |
+            **/*.py
+            refactor-report.json
+          retention-days: 30
+
+      - name: Generate detailed PR summary from report
+        id: pr_summary
+        run: |
+          REPORT="${{ github.workspace }}/refactor-report.json"
+
+          if [ -f "$REPORT" ]; then
+            python src/generate_pr_summary.py "$REPORT" > /tmp/pr_output.txt
+            cat /tmp/pr_output.txt >> $GITHUB_OUTPUT
+          else
+            echo "total=0" >> $GITHUB_OUTPUT
+            echo "bad=0" >> $GITHUB_OUTPUT
+            echo "refactored=0" >> $GITHUB_OUTPUT
+            echo "llms=N/A" >> $GITHUB_OUTPUT
+            echo "failed=0" >> $GITHUB_OUTPUT
+            echo "details=No report found." >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request with refactored code
+        if: always()
+        continue-on-error: true
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "CodeRefactor AI: Automated refactoring of bad-smell functions"
+          title: "[CodeRefactor AI] Automated Code Refactoring"
+          body: |
+            ## 🤖 Automated Code Refactoring
+
+            This PR was automatically created by the **CodeRefactor AI** pipeline.
+
+            ### 📊 Pipeline Results
+            | Metric | Count |
+            |--------|-------|
+            | Total functions analyzed | ${{ steps.pr_summary.outputs.total }} |
+            | Bad-smell functions detected | ${{ steps.pr_summary.outputs.bad }} |
+            | Functions refactored | ${{ steps.pr_summary.outputs.refactored }} |
+            | Functions failed | ${{ steps.pr_summary.outputs.failed }} |
+            | LLMs used | ${{ steps.pr_summary.outputs.llms }} |
+
+            ### 🔧 What Changed
+            Each bad-smell function was refactored in-place by the best-predicted
+            LLM (selected via composite score: quality, cost, speed, token usage).
+
+            #### Per-Function Details
+            ${{ steps.pr_summary.outputs.details }}
+
+            ### ✅ Review Checklist
+            - [ ] Verify each refactored function maintains original behavior
+            - [ ] Confirm docstrings, type hints, and code structure are correct
+            - [ ] Run existing tests to ensure nothing is broken
+
+            > 🤖 Generated by [CodeRefactor AI](https://github.com/${{ github.repository }})
+            > 📄 Full report available in the [Actions run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            > 🔍 Detailed analysis: check the "Run code smell analysis" step in the workflow run logs
+          branch: coderefactor-ai/refactoring-${{ github.run_id }}
+          base: main
+          labels: automated-refactoring
