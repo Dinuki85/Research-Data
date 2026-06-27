@@ -41,7 +41,7 @@ from src.refactoring_engine import refactor_function, verify_refactored_code
 from src.repo_analyzer import scan_functions, scan_files, clone_repository
 
 # ── Default config ───────────────────────────────────────────────────────────
-DEFAULT_API_KEY = "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"
+DEFAULT_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 
 def green(text):
