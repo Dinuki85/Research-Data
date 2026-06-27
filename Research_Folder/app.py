@@ -38,7 +38,7 @@ class DataProcessor:
             global_list.append(self.temp)
         
         if self.temp < 0:
-            print("Temperature negative!")
+            print("Temperature negative!?")
             self.temp = self.temp * 1.1
             self.counter += 1
             global_list.append(self.temp)
