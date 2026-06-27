@@ -32,7 +32,7 @@ class DataProcessor:
         
         # Duplicated code
         if self.temp > 50:
-            print("Temperature high!")
+            print("Temperature high?")
             self.temp = self.temp * 0.9
             self.counter += 1
             global_list.append(self.temp)
